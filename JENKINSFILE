@@ -1,0 +1,101 @@
+def logAgentInfo() {
+  echo WORKSPACE
+  echo env.NODE_NAME
+  sh 'whoami'
+  sh 'hostname'
+}
+pipeline {
+    agent { label 'default' } // default agent with linux and python installed
+    stages {
+        stage('Get Code') {
+            steps {
+                script { logAgentInfo() }
+                git 'https://github.com/luiinge/DevOps-helloworld'
+            }
+        }
+        stage('Unit') {
+            steps {
+               script { logAgentInfo() }
+               // unstash name: 'src'
+               catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                 // hemos de ejecutar las pruebas unitarias midiendo la cobertura al mismo tiempo
+                 sh 'PYTHONPATH=. python3 -m coverage run --source=app --omit=app/__init__.py,app/api.py -m pytest --junitxml=test-unit.xml test/unit --verbose'
+               }
+               junit 'test-unit.xml'
+            }
+        }
+        stage('Rest') {
+            steps {
+                script { logAgentInfo() }
+                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                  sh '''
+                     FLASK_APP=app/api.py flask run &
+                     FLASK_PID=$!
+                     java -jar /home/luis/bin/wiremock-standalone-3.13.2.jar --port 9090 --root-dir test/wiremock &
+                     WIREMOCK_PID=$!
+                     sleep 3
+                     PYTHONPATH=. pytest --junitxml=test-it.xml test/rest --verbose
+                     kill $WIREMOCK_PID
+                     kill $FLASK_PID
+                  '''
+                }
+                junit 'test-it.xml'
+            }
+        }
+        stage('Static') {
+            steps {
+                script { logAgentInfo() }
+                sh 'flake8 --format=pylint --exit-zero app > flake8.out'
+                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                  recordIssues tools: [flake8(pattern:'flake8.out')],
+                        qualityGates: [
+                            [threshold:8,  type:'TOTAL', unstable:true], // UNSTABLE
+                            [threshold:10, type:'TOTAL', unstable:false] // FAILURE
+                        ]
+                }
+            }
+        }
+        stage('Security Test') {
+            steps {
+               script { logAgentInfo() }
+               sh returnStatus:true, script: 'bandit -r . -f custom -o bandit.out --msg-template "{abspath}:{line}: {severity}: {test_id}: {msg}"'
+               catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                  recordIssues tools: [pyLint(pattern:'bandit.out')],
+                        qualityGates: [
+                            [threshold:2, type:'TOTAL', unstable:true], // UNSTABLE
+                            [threshold:4, type:'TOTAL', unstable:false] // FAILURE
+                        ]
+                }
+            }
+        }
+        stage('Coverage') {
+            steps {
+              script { logAgentInfo() }
+              // recuperamos el fichero .coverage de la etapa de Unit Testing
+              sh 'python3 -m coverage xml'
+              recordCoverage tools: [[parser: 'COBERTURA', pattern: 'coverage.xml']],
+                  qualityGates: [
+                      [threshold: 85.0, metric: 'LINE',   baseline: 'PROJECT', criticality: 'FAILURE'],
+                      [threshold: 95.0, metric: 'LINE',   baseline: 'PROJECT', criticality: 'UNSTABLE'],
+                      [threshold: 80.0, metric: 'BRANCH', baseline: 'PROJECT', criticality: 'FAILURE'],
+                      [threshold: 90.0, metric: 'BRANCH', baseline: 'PROJECT', criticality: 'UNSTABLE']
+                  ]
+          }
+
+        }
+        stage('Performance') {
+            steps {
+              script { logAgentInfo() }
+              sh '''
+                    FLASK_APP=app/api.py flask run &
+                    FLASK_PID=$!
+                    sleep 3
+                    /home/luis/bin/apache-jmeter-5.6.3/bin/jmeter -n -t test/jmeter/flask.jmx -l flask.jtl
+                    kill $FLASK_PID
+                  '''
+             perfReport sourceDataFiles: 'flask.jtl'
+            }
+        }
+
+    }
+}
